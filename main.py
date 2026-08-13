@@ -1,5 +1,6 @@
 import os
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -10,14 +11,65 @@ load_dotenv()
 
 app = FastAPI()
 
-client = OpenAI(
-    api_key=os.environ.get("SUPER_MIND_API_KEY"),
-    base_url="https://space.ai-builders.com/backend/v1",
-)
+API_KEY = os.environ.get("SUPER_MIND_API_KEY")
+BASE_URL = "https://space.ai-builders.com/backend/v1"
+
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 
 class ChatRequest(BaseModel):
     user_message: str
+
+
+# ---------------------------------------------------------------------------
+# Agentic tools
+#
+# A "tool" has two halves:
+#   1. web_search()  -> the real Python function that does the work.
+#   2. WEB_SEARCH_TOOL -> a JSON schema describing the tool to the LLM, so the
+#      LLM knows the tool exists, what it does, and what arguments it takes.
+# The LLM never runs the function itself; it only decides to *call* it and
+# emits a structured tool call. Our code is what actually executes it.
+# ---------------------------------------------------------------------------
+
+
+def web_search(query: str):
+    """Call the internal search API and return its JSON results."""
+    response = httpx.post(
+        f"{BASE_URL}/search/",
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={"keywords": [query], "max_results": 3},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+# JSON schema the LLM reads to understand the tool (OpenAI function-calling format).
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "Search the web for current, real-time, or factual information that "
+            "may not be in the model's training data — recent events, news, "
+            "weather, sports results, prices, etc."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query, e.g. 'who won the Super Bowl 2024'",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -41,6 +93,44 @@ def chat(request: ChatRequest):
         raise HTTPException(status_code=502, detail=f"Upstream API error: {exc}")
 
     return {"response": completion.choices[0].message.content}
+
+
+@app.post("/agent")
+def agent(request: ChatRequest):
+    """Step 1 of the agentic loop: let the LLM *decide* whether to use a tool.
+
+    We hand the model the tool schema and let it choose (tool_choice="auto").
+    We do NOT run the tool yet — we just surface the decision so we can verify
+    the LLM emits a valid tool call for questions that need fresh information.
+    """
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-5",
+            messages=[{"role": "user", "content": request.user_message}],
+            tools=[WEB_SEARCH_TOOL],
+            tool_choice="auto",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream API error: {exc}")
+
+    message = completion.choices[0].message
+
+    # The LLM decided it needs a tool: it returns structured tool_calls.
+    if message.tool_calls:
+        return {
+            "decision": "tool_call",
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "name": call.function.name,
+                    "arguments": call.function.arguments,
+                }
+                for call in message.tool_calls
+            ],
+        }
+
+    # The LLM answered directly from its own knowledge.
+    return {"decision": "answer", "response": message.content}
 
 
 CHAT_PAGE = """<!doctype html>
