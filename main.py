@@ -99,6 +99,7 @@ def chat(request: ChatRequest):
     """The full agentic loop: reason -> (maybe) call a tool -> feed the result
     back -> reason again, up to MAX_TURNS times, then answer.
     """
+    log(f"[User] Question: '{request.user_message}'")
     messages = [{"role": "user", "content": request.user_message}]
 
     try:
