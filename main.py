@@ -1,3 +1,4 @@
+import json
 import os
 
 import httpx
@@ -71,6 +72,12 @@ WEB_SEARCH_TOOL = {
     },
 }
 
+# The list we hand the LLM, and a registry mapping each tool name to the real
+# Python function so the loop can look it up and actually run it.
+TOOLS = [WEB_SEARCH_TOOL]
+AVAILABLE_TOOLS = {"web_search": web_search}
+MAX_TURNS = 3
+
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -82,17 +89,86 @@ def hello(name: str):
     return {"message": f"Hello, World {name}"}
 
 
+def log(line: str):
+    """Print to the console (Render Logs) and flush so it shows up immediately."""
+    print(line, flush=True)
+
+
 @app.post("/chat")
 def chat(request: ChatRequest):
+    """The full agentic loop: reason -> (maybe) call a tool -> feed the result
+    back -> reason again, up to MAX_TURNS times, then answer.
+    """
+    messages = [{"role": "user", "content": request.user_message}]
+
     try:
-        completion = client.chat.completions.create(
-            model="gpt-5",
-            messages=[{"role": "user", "content": request.user_message}],
-        )
+        for turn in range(MAX_TURNS):
+            completion = client.chat.completions.create(
+                model="gpt-5",
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+            message = completion.choices[0].message
+
+            # No tool call -> the LLM is done reasoning and gave a final answer.
+            if not message.tool_calls:
+                log(f"[Agent] Final Answer: '{message.content}'")
+                return {"response": message.content}
+
+            # Record the assistant's decision (its tool calls) in the transcript.
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.function.name,
+                                "arguments": call.function.arguments,
+                            },
+                        }
+                        for call in message.tool_calls
+                    ],
+                }
+            )
+
+            # Execute every tool the LLM asked for, and feed each result back.
+            for call in message.tool_calls:
+                name = call.function.name
+                args = json.loads(call.function.arguments or "{}")
+                log(f"[Agent] Decided to call tool: '{name}' (turn {turn + 1}) args={args}")
+
+                func = AVAILABLE_TOOLS.get(name)
+                if func is None:
+                    result = {"error": f"Unknown tool: {name}"}
+                else:
+                    try:
+                        result = func(**args)
+                    except Exception as tool_error:
+                        result = {"error": str(tool_error)}
+
+                result_str = json.dumps(result, ensure_ascii=False)
+                log(f"[System] Tool Output: '{result_str[:800]}'")
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": result_str,
+                    }
+                )
+
+        # Ran out of turns while still calling tools: force a final text answer.
+        final = client.chat.completions.create(model="gpt-5", messages=messages)
+        answer = final.choices[0].message.content
+        log(f"[Agent] Final Answer (after {MAX_TURNS} turns): '{answer}'")
+        return {"response": answer}
+
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Upstream API error: {exc}")
-
-    return {"response": completion.choices[0].message.content}
 
 
 @app.post("/agent")
