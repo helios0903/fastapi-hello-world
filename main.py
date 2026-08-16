@@ -174,6 +174,18 @@ def log(line: str):
     print(line, flush=True)
 
 
+def dump_context_trace(messages: list):
+    """Print the ENTIRE message history the model saw — the agent's 'mind'.
+
+    Reading this context trace is how you debug an agent: you see exactly what
+    the model looked at (every role, the raw tool_calls object, the tool results
+    with their tool_call_id, and the final answer) before it decided. Debugging
+    an agent = reading its context trace, not guessing.
+    """
+    log("[Context Trace] full message history the model saw:")
+    log(json.dumps(messages, ensure_ascii=False, indent=2))
+
+
 @app.post("/chat")
 def chat(request: ChatRequest):
     """The full agentic loop: reason -> (maybe) call a tool -> feed the result
@@ -197,6 +209,8 @@ def chat(request: ChatRequest):
 
             # No tool call -> the LLM is done reasoning and gave a final answer.
             if not message.tool_calls:
+                messages.append({"role": "assistant", "content": message.content})
+                dump_context_trace(messages)  # the full chain of thought
                 log(f"[Agent] Final Answer: '{message.content}'")
                 return {"response": message.content}
 
@@ -248,6 +262,8 @@ def chat(request: ChatRequest):
         # Ran out of turns while still calling tools: force a final text answer.
         final = client.chat.completions.create(model="gpt-5", messages=messages)
         answer = final.choices[0].message.content
+        messages.append({"role": "assistant", "content": answer})
+        dump_context_trace(messages)  # the full chain of thought
         log(f"[Agent] Final Answer (after {MAX_TURNS} turns): '{answer}'")
         return {"response": answer}
 
