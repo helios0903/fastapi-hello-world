@@ -2,6 +2,7 @@ import json
 import os
 
 import httpx
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -72,17 +73,69 @@ WEB_SEARCH_TOOL = {
     },
 }
 
+def read_page(url: str):
+    """Fetch a web page and return its main text with tags/scripts/styles stripped."""
+    response = httpx.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; AgentBot/1.0)"},
+        timeout=30,
+        follow_redirects=True,
+    )
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    # Collapse whitespace and drop blank lines so the LLM gets clean text.
+    lines = [line.strip() for line in soup.get_text(separator="\n").splitlines()]
+    text = "\n".join(line for line in lines if line)
+
+    # Cap the length so one big page can't blow up the context window.
+    max_chars = 6000
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n...[truncated]"
+
+    return {"url": url, "text": text}
+
+
+READ_PAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_page",
+        "description": (
+            "Fetch a web page by its URL and return its main text content. Use "
+            "this AFTER web_search to read the full content of a specific result "
+            "— an article, a changelog, or a documentation page."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The full URL to read, e.g. 'https://docs.python.org/3/whatsnew/3.13.html'",
+                }
+            },
+            "required": ["url"],
+        },
+    },
+}
+
 # The list we hand the LLM, and a registry mapping each tool name to the real
-# Python function so the loop can look it up and actually run it.
-TOOLS = [WEB_SEARCH_TOOL]
-AVAILABLE_TOOLS = {"web_search": web_search}
-MAX_TURNS = 3
+# Python function so the loop can look it up and actually run it. The loop is
+# generic, so adding a tool is just: add its schema here + its function below.
+TOOLS = [WEB_SEARCH_TOOL, READ_PAGE_TOOL]
+AVAILABLE_TOOLS = {"web_search": web_search, "read_page": read_page}
+# Higher now: a "search -> read that page -> answer" flow spends several turns.
+MAX_TURNS = 5
 
 # Guardrails for how the agent should treat search results:
 #  1. cite the sources it actually relied on
 #  2. be honest about conflicts / weak evidence instead of fabricating
 SYSTEM_PROMPT = (
-    "You are a helpful assistant with access to a web_search tool.\n"
+    "You are a helpful assistant with two tools: web_search (to find pages) and "
+    "read_page (to read the full text of a specific URL). A common pattern is to "
+    "web_search first, then read_page the most relevant result for details.\n"
     "\n"
     "STYLE — structured but concise:\n"
     "- Lead with a direct 2-3 sentence conclusion before any detail.\n"
@@ -214,7 +267,7 @@ def agent(request: ChatRequest):
         completion = client.chat.completions.create(
             model="gpt-5",
             messages=[{"role": "user", "content": request.user_message}],
-            tools=[WEB_SEARCH_TOOL],
+            tools=TOOLS,
             tool_choice="auto",
         )
     except Exception as exc:
