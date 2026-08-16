@@ -78,6 +78,22 @@ TOOLS = [WEB_SEARCH_TOOL]
 AVAILABLE_TOOLS = {"web_search": web_search}
 MAX_TURNS = 3
 
+# Guardrails for how the agent should treat search results:
+#  1. cite the sources it actually relied on
+#  2. be honest about conflicts / weak evidence instead of fabricating
+SYSTEM_PROMPT = (
+    "You are a helpful assistant with access to a web_search tool.\n"
+    "When you answer using information from search results, follow these rules:\n"
+    "1. CITE YOUR SOURCES. At the end of your answer, add a '来源 / Sources' "
+    "section listing the source URLs you actually relied on. If you did not use "
+    "the web_search tool, do not invent sources.\n"
+    "2. BE HONEST ABOUT UNCERTAINTY. If the sources disagree with each other, say "
+    "so and explain the disagreement. If the results do not clearly answer the "
+    "question, or the evidence is weak, tell the user you are not certain rather "
+    "than guessing. Never fabricate facts or fake a source.\n"
+    "Always answer in the same language the user used."
+)
+
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -100,7 +116,10 @@ def chat(request: ChatRequest):
     back -> reason again, up to MAX_TURNS times, then answer.
     """
     log(f"[User] Question: '{request.user_message}'")
-    messages = [{"role": "user", "content": request.user_message}]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": request.user_message},
+    ]
 
     try:
         for turn in range(MAX_TURNS):
