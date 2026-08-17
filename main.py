@@ -1,5 +1,6 @@
 import json
 import os
+from uuid import uuid4
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,6 +22,7 @@ client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 class ChatRequest(BaseModel):
     user_message: str
+    conversation_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +160,12 @@ SYSTEM_PROMPT = (
     "Always answer in the same language the user used."
 )
 
+# The agent's "memory": conversation_id -> full message history.
+# NOTE: this lives in the server's RAM, so it resets when Render restarts or
+# spins down, and it grows over time. A real app would use a database and trim
+# or summarize old turns — that trimming is itself context engineering.
+CONVERSATIONS: dict[str, list] = {}
+
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -191,11 +199,15 @@ def chat(request: ChatRequest):
     """The full agentic loop: reason -> (maybe) call a tool -> feed the result
     back -> reason again, up to MAX_TURNS times, then answer.
     """
-    log(f"[User] Question: '{request.user_message}'")
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": request.user_message},
-    ]
+    convo_id = request.conversation_id or uuid4().hex
+    # Load this conversation's past messages (the "memory"), or start fresh.
+    # list(...) copies it so a mid-loop error can't corrupt the stored history.
+    messages = list(CONVERSATIONS.get(convo_id) or [{"role": "system", "content": SYSTEM_PROMPT}])
+    messages.append({"role": "user", "content": request.user_message})
+    log(
+        f"[User] Question: '{request.user_message}' "
+        f"(convo {convo_id[:8]}, {len(messages)} msgs already in context)"
+    )
 
     try:
         for turn in range(MAX_TURNS):
@@ -212,7 +224,8 @@ def chat(request: ChatRequest):
                 messages.append({"role": "assistant", "content": message.content})
                 dump_context_trace(messages)  # the full chain of thought
                 log(f"[Agent] Final Answer: '{message.content}'")
-                return {"response": message.content}
+                CONVERSATIONS[convo_id] = messages  # remember for next turn
+                return {"response": message.content, "conversation_id": convo_id}
 
             # Record the assistant's decision (its tool calls) in the transcript.
             messages.append(
@@ -265,7 +278,8 @@ def chat(request: ChatRequest):
         messages.append({"role": "assistant", "content": answer})
         dump_context_trace(messages)  # the full chain of thought
         log(f"[Agent] Final Answer (after {MAX_TURNS} turns): '{answer}'")
-        return {"response": answer}
+        CONVERSATIONS[convo_id] = messages  # remember for next turn
+        return {"response": answer, "conversation_id": convo_id}
 
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Upstream API error: {exc}")
@@ -369,6 +383,18 @@ CHAT_PAGE = """<!doctype html>
       gap: 8px;
     }
     header .dot { width: 9px; height: 9px; border-radius: 50%; background: #22c55e; }
+    header .title { flex: 1; }
+    #reset {
+      font-size: 13px;
+      font-weight: 500;
+      padding: 6px 11px;
+      border-radius: 9px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    #reset:hover { color: var(--text); border-color: var(--user); }
     #messages {
       flex: 1;
       overflow-y: auto;
@@ -426,7 +452,11 @@ CHAT_PAGE = """<!doctype html>
 </head>
 <body>
   <div class="app">
-    <header><span class="dot"></span> My AI Chat</header>
+    <header>
+      <span class="dot"></span>
+      <span class="title">My AI Chat</span>
+      <button id="reset" type="button">新对话</button>
+    </header>
     <div id="messages">
       <div class="hint">给 AI 发条消息开始聊天吧 👋</div>
     </div>
@@ -441,7 +471,24 @@ CHAT_PAGE = """<!doctype html>
     const form = document.getElementById("form");
     const input = document.getElementById("input");
     const sendBtn = document.getElementById("send");
+    const resetBtn = document.getElementById("reset");
     let firstMessage = true;
+
+    // A stable id ties every message on this page into ONE conversation, so the
+    // server can load the history back into context each turn (that's memory).
+    function newId() {
+      return (crypto.randomUUID && crypto.randomUUID()) || String(Math.random()).slice(2);
+    }
+    let conversationId = newId();
+
+    // "新对话" starts a fresh conversation_id -> the server has no history for
+    // it, so the agent's context is empty again. New id = blank memory.
+    resetBtn.addEventListener("click", () => {
+      conversationId = newId();
+      messages.innerHTML = '<div class="hint">给 AI 发条消息开始聊天吧 👋</div>';
+      firstMessage = true;
+      input.focus();
+    });
 
     function addBubble(text, who, extraClass) {
       if (firstMessage) { messages.innerHTML = ""; firstMessage = false; }
@@ -484,7 +531,7 @@ CHAT_PAGE = """<!doctype html>
         const res = await fetch("/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_message: text }),
+          body: JSON.stringify({ user_message: text, conversation_id: conversationId }),
         });
         const data = await res.json();
         if (!res.ok) {
